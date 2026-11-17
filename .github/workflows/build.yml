@@ -1,0 +1,40 @@
+# Builds the plugin on every push, and attaches fotoshi.jar to each published release.
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  release:
+    types: [published]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # to attach the jar to a release
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      # built against the oldest JOSM it supports, Plugin-Mainversion in MANIFEST.MF
+      - name: Get JOSM
+        run: |
+          josm=$(sed -n 's/^Plugin-Mainversion: *//p' MANIFEST.MF | tr -d '\r')
+          curl -fsSL -o josm.jar "https://josm.openstreetmap.de/download/Archiv/josm-snapshot-$josm.jar"
+      - name: Build
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: JOSM_JAR=josm.jar VERSION="${TAG#v}" ./build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fotoshi.jar
+          path: build/fotoshi.jar
+      - name: Attach to the release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload "$TAG" build/fotoshi.jar --clobber

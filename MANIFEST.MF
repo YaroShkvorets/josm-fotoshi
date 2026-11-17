@@ -1,0 +1,8 @@
+Plugin-Class: org.openstreetmap.josm.plugins.fotoshi.FotoshiPlugin
+Plugin-Mainversion: 18822
+Plugin-Minimum-Java-Version: 11
+Plugin-Canloadatruntime: true
+Plugin-Icon: images/dialogs/fotoshi.svg
+Plugin-Link: https://github.com/YaroShkvorets/josm-fotoshi
+Plugin-Description: Shows the photos in the selected object's image:fotoshi tag
+Author: YaroShkvorets
