@@ -5,11 +5,13 @@ import java.awt.BorderLayout;
 import java.awt.Cursor;
 import java.awt.Graphics;
 import java.awt.Graphics2D;
+import java.awt.Point;
 import java.awt.RenderingHints;
 import java.awt.event.ActionEvent;
 import java.awt.event.KeyEvent;
 import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
+import java.awt.event.MouseWheelEvent;
 import java.awt.image.BufferedImage;
 import java.io.IOException;
 import java.io.InputStream;
@@ -44,7 +46,8 @@ import org.openstreetmap.josm.tools.Shortcut;
 
 /**
  * A panel showing the photos in the selected object's image:fotoshi tag (photo ids separated by ;), one at a
- * time, straight from Fotoshi's CDN: no key needed. A click on the photo opens its page on fotoshi.com.
+ * time, straight from Fotoshi's CDN: no key needed. A click on the photo opens its page on fotoshi.com; the mouse
+ * wheel zooms in and out, and dragging moves a zoomed-in photo.
  */
 public class FotoshiDialog extends ToggleDialog implements DataSelectionListener {
     private static final String TAG = "image:fotoshi";
@@ -52,11 +55,11 @@ public class FotoshiDialog extends ToggleDialog implements DataSelectionListener
     private static final String PAGE = "https://fotoshi.com/photo/%s";
     private static final int CACHED = 30;
 
-    private final Photo photo = new Photo();
     private final JLabel caption = new JLabel(" ", SwingConstants.CENTER);
     private final StepAction previous = new StepAction(-1, "previous", "Previous photo");
     private final StepAction next = new StepAction(1, "next", "Next photo");
     private final OpenAction open = new OpenAction();
+    private final Photo photo = new Photo(() -> open.actionPerformed(null));
 
     private final ExecutorService loader = Executors.newSingleThreadExecutor(r -> {
         Thread t = new Thread(r, "fotoshi-photos");
@@ -82,12 +85,6 @@ public class FotoshiDialog extends ToggleDialog implements DataSelectionListener
         JPanel panel = new JPanel(new BorderLayout());
         panel.add(photo, BorderLayout.CENTER);
         panel.add(caption, BorderLayout.SOUTH);
-        photo.addMouseListener(new MouseAdapter() {
-            @Override
-            public void mouseClicked(MouseEvent e) {
-                open.actionPerformed(null);
-            }
-        });
         Collection<SideButton> buttons = Arrays.asList(new SideButton(previous), new SideButton(next), new SideButton(open));
         createLayout(panel, false, buttons);
         showPhotosOf(List.of());
@@ -212,20 +209,103 @@ public class FotoshiDialog extends ToggleDialog implements DataSelectionListener
         }
     }
 
-    /** The photo, scaled to fit and centred; or a line of text when there is none. */
+    /**
+     * The photo, scaled to fit and centred; or a line of text when there is none. The mouse wheel zooms in and out
+     * around the pointer, dragging moves a zoomed-in photo, and a click (not a drag) runs onClick.
+     */
     private static class Photo extends JLabel {
-        private BufferedImage image;
+        private static final double MAX_SCALE = 4; // screen pixels per photo pixel, when zoomed all the way in
+        private static final double STEP = 1.25; // zoom per wheel notch
 
-        Photo() {
+        private final Runnable onClick;
+        private BufferedImage image;
+        private double zoom = 1; // 1 fits the whole photo
+        private double cx, cy; // the photo pixel at the panel's centre
+        private Point dragFrom;
+        private double dragCx, dragCy;
+        private boolean dragged;
+
+        Photo(Runnable onClick) {
+            this.onClick = onClick;
             setHorizontalAlignment(SwingConstants.CENTER);
+            MouseAdapter mouse = new MouseAdapter() {
+                @Override
+                public void mousePressed(MouseEvent e) {
+                    dragFrom = e.getPoint();
+                    dragCx = cx;
+                    dragCy = cy;
+                    dragged = false;
+                }
+
+                @Override
+                public void mouseDragged(MouseEvent e) {
+                    if (image == null || dragFrom == null || !dragged && dragFrom.distance(e.getPoint()) < 3) return;
+                    dragged = true;
+                    double s = scale();
+                    cx = dragCx - (e.getX() - dragFrom.x) / s;
+                    cy = dragCy - (e.getY() - dragFrom.y) / s;
+                    repaint();
+                }
+
+                @Override
+                public void mouseClicked(MouseEvent e) {
+                    if (!dragged) onClick.run();
+                }
+
+                @Override
+                public void mouseWheelMoved(MouseWheelEvent e) {
+                    // shift + wheel, and a sideways swipe on a trackpad, scroll sideways: not a zoom
+                    if (image != null && !e.isShiftDown()) zoomAt(e.getPoint(), Math.pow(STEP, -e.getPreciseWheelRotation()));
+                }
+            };
+            addMouseListener(mouse);
+            addMouseMotionListener(mouse);
+            addMouseWheelListener(mouse);
         }
 
         void display(BufferedImage image, String text) {
             this.image = image;
+            zoom = 1;
             setText(text == null ? null : "<html><div style='text-align:center'>" + text + "</div></html>");
-            setToolTipText(image == null ? null : "Open the photo's page on fotoshi.com");
+            setToolTipText(image == null ? null : "Click to open the photo's page on fotoshi.com; scroll to zoom, drag to move");
             setCursor(Cursor.getPredefinedCursor(image == null ? Cursor.DEFAULT_CURSOR : Cursor.HAND_CURSOR));
             repaint();
+        }
+
+        /** Zooms by a factor, keeping the photo pixel under p where it is. */
+        private void zoomAt(Point p, double by) {
+            keepInView();
+            double dx = p.x - getWidth() / 2.0;
+            double dy = p.y - getHeight() / 2.0;
+            double s = scale();
+            double x = cx + dx / s;
+            double y = cy + dy / s;
+            zoom = Math.max(1, Math.min(zoom * by, MAX_SCALE / fit()));
+            s = scale();
+            cx = x - dx / s;
+            cy = y - dy / s;
+            repaint();
+        }
+
+        /** Screen pixels per photo pixel, at zoom 1. */
+        private double fit() {
+            return Math.min((double) getWidth() / image.getWidth(), (double) getHeight() / image.getHeight());
+        }
+
+        private double scale() {
+            return fit() * zoom;
+        }
+
+        /** Moves the centre so the photo fills the panel, or is centred on an axis where it is smaller. */
+        private void keepInView() {
+            double s = scale();
+            cx = centre(cx, image.getWidth(), getWidth() / s);
+            cy = centre(cy, image.getHeight(), getHeight() / s);
+        }
+
+        /** Where to centre a view span photo pixels long, as near c as keeps it on a photo size pixels long. */
+        private static double centre(double c, double size, double span) {
+            return span >= size ? size / 2 : Math.max(span / 2, Math.min(c, size - span / 2));
         }
 
         @Override
@@ -234,12 +314,13 @@ public class FotoshiDialog extends ToggleDialog implements DataSelectionListener
                 super.paintComponent(g);
                 return;
             }
-            double scale = Math.min((double) getWidth() / image.getWidth(), (double) getHeight() / image.getHeight());
-            int w = (int) Math.round(image.getWidth() * scale);
-            int h = (int) Math.round(image.getHeight() * scale);
+            if (getWidth() == 0 || getHeight() == 0) return;
+            keepInView();
+            double s = scale();
             Graphics2D g2 = (Graphics2D) g.create();
             g2.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
-            g2.drawImage(image, (getWidth() - w) / 2, (getHeight() - h) / 2, w, h, null);
+            g2.drawImage(image, (int) Math.round(getWidth() / 2.0 - cx * s), (int) Math.round(getHeight() / 2.0 - cy * s),
+                    (int) Math.round(image.getWidth() * s), (int) Math.round(image.getHeight() * s), null);
             g2.dispose();
         }
     }

@@ -3,6 +3,7 @@
 A [JOSM](https://josm.openstreetmap.de) plugin. Its Fotoshi panel shows the photos in the selected object's `image:fotoshi` tag, one at a time. The tag holds [Fotoshi](https://fotoshi.com) photo ids, separated by `;` when there are several.
 
 - ‹ › step through the photos.
+- Scroll over the photo to zoom in and out around the pointer, and drag to move a zoomed-in photo.
 - A click on the photo, or **Open**, shows its page on fotoshi.com, with the photographer and licence.
 - Photos come straight from Fotoshi's CDN, so no key or account is needed.
 
