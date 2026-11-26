@@ -4,6 +4,7 @@ A [JOSM](https://josm.openstreetmap.de) plugin. Its Fotoshi panel shows the phot
 
 - ‹ › step through the photos.
 - Scroll over the photo to zoom in and out around the pointer, and drag to move a zoomed-in photo.
+- **Move to front** makes the shown photo the first in the tag, and **Remove** takes it out of the tag (the whole tag, when it was the last photo). They're ordinary edits, so Undo reverts them.
 - A click on the photo, or **Open**, shows its page on fotoshi.com, with the photographer and licence.
 - Photos come straight from Fotoshi's CDN, so no key or account is needed.
 

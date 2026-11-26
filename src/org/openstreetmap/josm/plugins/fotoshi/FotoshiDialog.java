@@ -24,6 +24,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.function.ObjIntConsumer;
 
 import javax.imageio.ImageIO;
 import javax.swing.AbstractAction;
@@ -31,9 +32,14 @@ import javax.swing.JLabel;
 import javax.swing.JPanel;
 import javax.swing.SwingConstants;
 
+import org.openstreetmap.josm.command.ChangePropertyCommand;
+import org.openstreetmap.josm.data.UndoRedoHandler;
 import org.openstreetmap.josm.data.osm.DataSelectionListener;
 import org.openstreetmap.josm.data.osm.DataSet;
 import org.openstreetmap.josm.data.osm.OsmPrimitive;
+import org.openstreetmap.josm.data.osm.event.DataSetListenerAdapter;
+import org.openstreetmap.josm.data.osm.event.DatasetEventManager;
+import org.openstreetmap.josm.data.osm.event.DatasetEventManager.FireMode;
 import org.openstreetmap.josm.data.osm.event.SelectionEventManager;
 import org.openstreetmap.josm.gui.MainApplication;
 import org.openstreetmap.josm.gui.SideButton;
@@ -47,7 +53,8 @@ import org.openstreetmap.josm.tools.Shortcut;
 /**
  * A panel showing the photos in the selected object's image:fotoshi tag (photo ids separated by ;), one at a
  * time, straight from Fotoshi's CDN: no key needed. A click on the photo opens its page on fotoshi.com; the mouse
- * wheel zooms in and out, and dragging moves a zoomed-in photo.
+ * wheel zooms in and out, and dragging moves a zoomed-in photo. Move to front makes the shown photo the first in the
+ * tag, and Remove takes it out of the tag, as edits that can be undone.
  */
 public class FotoshiDialog extends ToggleDialog implements DataSelectionListener {
     private static final String TAG = "image:fotoshi";
@@ -59,7 +66,11 @@ public class FotoshiDialog extends ToggleDialog implements DataSelectionListener
     private final StepAction previous = new StepAction(-1, "previous", "Previous photo");
     private final StepAction next = new StepAction(1, "next", "Next photo");
     private final OpenAction open = new OpenAction();
+    private final ToFrontAction toFront = new ToFrontAction();
+    private final RemoveAction remove = new RemoveAction();
     private final Photo photo = new Photo(() -> open.actionPerformed(null));
+    // the tag can change under us: an edit in the tag editor, Move to front, Remove, or an undo
+    private final DataSetListenerAdapter changes = new DataSetListenerAdapter(e -> showPhotosOfSelection());
 
     private final ExecutorService loader = Executors.newSingleThreadExecutor(r -> {
         Thread t = new Thread(r, "fotoshi-photos");
@@ -74,6 +85,7 @@ public class FotoshiDialog extends ToggleDialog implements DataSelectionListener
         }
     };
 
+    private OsmPrimitive source; // the object the photos are from
     private List<String> ids = new ArrayList<>();
     private int index;
     private int request; // so a photo that comes in late doesn't replace a newer one
@@ -85,7 +97,8 @@ public class FotoshiDialog extends ToggleDialog implements DataSelectionListener
         JPanel panel = new JPanel(new BorderLayout());
         panel.add(photo, BorderLayout.CENTER);
         panel.add(caption, BorderLayout.SOUTH);
-        Collection<SideButton> buttons = Arrays.asList(new SideButton(previous), new SideButton(next), new SideButton(open));
+        Collection<SideButton> buttons = Arrays.asList(new SideButton(previous), new SideButton(next), new SideButton(toFront),
+                new SideButton(remove), new SideButton(open));
         createLayout(panel, false, buttons);
         showPhotosOf(List.of());
     }
@@ -93,13 +106,14 @@ public class FotoshiDialog extends ToggleDialog implements DataSelectionListener
     @Override
     public void showNotify() {
         SelectionEventManager.getInstance().addSelectionListenerForEdt(this);
-        DataSet data = MainApplication.getLayerManager().getActiveDataSet();
-        showPhotosOf(data == null ? List.of() : data.getSelected());
+        DatasetEventManager.getInstance().addDatasetListener(changes, FireMode.IN_EDT_CONSOLIDATED);
+        showPhotosOfSelection();
     }
 
     @Override
     public void hideNotify() {
         SelectionEventManager.getInstance().removeSelectionListener(this);
+        DatasetEventManager.getInstance().removeDatasetListener(changes);
     }
 
     @Override
@@ -113,27 +127,85 @@ public class FotoshiDialog extends ToggleDialog implements DataSelectionListener
         showPhotosOf(event.getSelection());
     }
 
+    private void showPhotosOfSelection() {
+        DataSet data = MainApplication.getLayerManager().getActiveDataSet();
+        showPhotosOf(data == null ? List.of() : data.getSelected());
+    }
+
     /** Shows the photos of the first selected object that has the tag. */
     private void showPhotosOf(Collection<? extends OsmPrimitive> selection) {
-        List<String> found = new ArrayList<>();
+        OsmPrimitive before = source;
+        List<String> found = List.of();
+        source = null;
         for (OsmPrimitive p : selection) {
-            String value = p.get(TAG);
-            if (value == null) continue;
-            for (String id : value.split(";")) if (id.trim().matches("[A-Za-z0-9_-]+")) found.add(id.trim());
-            if (!found.isEmpty()) break;
+            found = idsIn(p.get(TAG));
+            if (!found.isEmpty()) {
+                source = p;
+                break;
+            }
         }
-        if (found.equals(ids) && !ids.isEmpty()) return; // the same object again: stay on its photo
+        if (found.equals(ids) && !ids.isEmpty()) { // the same photos again: stay on the one shown
+            updateActions();
+            return;
+        }
+        String shown = ids.isEmpty() ? null : ids.get(index);
         ids = found;
-        index = 0;
+        if (source != null && source == before) {
+            // the same object, its tag edited: stay on the photo shown, or show the one now in its place
+            int at = ids.indexOf(shown);
+            index = at >= 0 ? at : Math.min(index, ids.size() - 1);
+        } else {
+            index = 0;
+        }
         load();
+    }
+
+    private static boolean isId(String s) {
+        return s.matches("[A-Za-z0-9_-]+");
+    }
+
+    /** The photo ids in a tag value, in order. */
+    private static List<String> idsIn(String value) {
+        List<String> found = new ArrayList<>();
+        if (value != null) for (String part : value.split(";")) if (isId(part.trim())) found.add(part.trim());
+        return found;
+    }
+
+    /**
+     * Edits the source's tag, as a command that can be undone. The edit gets the ;-separated parts of the value,
+     * trimmed and without empty ones, and where the shown photo is among them; anything that isn't a photo id stays.
+     * The tag is removed when no part is left.
+     */
+    private void editTag(ObjIntConsumer<List<String>> edit) {
+        List<String> parts = new ArrayList<>();
+        for (String part : source.get(TAG).split(";")) if (!part.trim().isEmpty()) parts.add(part.trim());
+        for (int i = 0, seen = -1; i < parts.size(); i++) {
+            if (isId(parts.get(i)) && ++seen == index) {
+                edit.accept(parts, i);
+                String value = parts.isEmpty() ? null : String.join(";", parts);
+                // the dataset listener then shows the photos as they are now
+                UndoRedoHandler.getInstance().add(new ChangePropertyCommand(source, TAG, value));
+                return;
+            }
+        }
+    }
+
+    private boolean editable() {
+        return source != null && source.getDataSet() != null && !source.getDataSet().isLocked();
+    }
+
+    private void updateActions() {
+        previous.setEnabled(ids.size() > 1);
+        next.setEnabled(ids.size() > 1);
+        open.setEnabled(!ids.isEmpty());
+        toFront.setEnabled(index > 0 && editable());
+        remove.setEnabled(!ids.isEmpty() && editable());
     }
 
     private void load() {
         int mine = ++request;
         boolean any = !ids.isEmpty();
-        previous.setEnabled(ids.size() > 1);
-        next.setEnabled(ids.size() > 1);
-        open.setEnabled(any);
+        updateActions();
         if (!any) {
             photo.display(null, "Select an object with " + TAG);
             caption.setText(" ");
@@ -193,6 +265,32 @@ public class FotoshiDialog extends ToggleDialog implements DataSelectionListener
             if (ids.size() < 2) return;
             index = (index + by + ids.size()) % ids.size();
             load();
+        }
+    }
+
+    private class ToFrontAction extends AbstractAction {
+        ToFrontAction() {
+            putValue(NAME, "Move to front");
+            putValue(SHORT_DESCRIPTION, "Make this the first photo in the object's " + TAG + " tag");
+            new ImageProvider("dialogs", "first").getResource().attachImageIcon(this, true);
+        }
+
+        @Override
+        public void actionPerformed(ActionEvent e) {
+            if (isEnabled()) editTag((parts, at) -> parts.add(0, parts.remove(at)));
+        }
+    }
+
+    private class RemoveAction extends AbstractAction {
+        RemoveAction() {
+            putValue(NAME, "Remove");
+            putValue(SHORT_DESCRIPTION, "Remove this photo from the object's " + TAG + " tag");
+            new ImageProvider("dialogs", "delete").getResource().attachImageIcon(this, true);
+        }
+
+        @Override
+        public void actionPerformed(ActionEvent e) {
+            if (isEnabled()) editTag((parts, at) -> parts.remove(at));
         }
     }
 
